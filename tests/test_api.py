@@ -87,6 +87,37 @@ def test_creates_task_and_summary(test_app, keypair: tuple[object, Path]) -> Non
     assert summary.json()["total"] == 3
 
 
+def test_task_queries_treat_quoted_owner_as_literal(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        tasks = client.get("/api/tasks", headers=headers(private_key), params={"owner": "student's team"})
+        summary = client.get("/api/summary", headers=headers(private_key), params={"owner": "student's team"})
+
+    assert tasks.status_code == 200
+    assert tasks.json() == []
+    assert summary.status_code == 200
+    assert summary.json() == {
+        "owner": "student's team",
+        "total": 0,
+        "byStatus": {},
+        "highPriorityOpen": 0,
+    }
+
+
+def test_task_creation_preserves_quoted_text(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers(private_key),
+            json={"title": "Owner's task", "description": "Needs user's review"},
+        )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == "Owner's task"
+    assert response.json()["description"] == "Needs user's review"
+
+
 def test_uploads_requirement(test_app, keypair: tuple[object, Path], tmp_path: Path) -> None:
     private_key, _ = keypair
     with TestClient(test_app) as client:
@@ -97,6 +128,24 @@ def test_uploads_requirement(test_app, keypair: tuple[object, Path], tmp_path: P
         )
     assert response.status_code == 201
     assert (tmp_path / "uploads" / "requirements.txt").exists()
+
+
+def test_backend_health_does_not_expose_exception(test_app, keypair: tuple[object, Path], monkeypatch) -> None:
+    private_key, _ = keypair
+
+    def fail_request(*args, **kwargs) -> None:
+        raise RuntimeError("sensitive downstream details")
+
+    monkeypatch.setattr("app.main.urllib3.PoolManager.request", fail_request)
+    with TestClient(test_app) as client:
+        response = client.get("/api/backend-health", headers=headers(private_key))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "requestedBy": "student",
+        "status": 0,
+        "body": "Backend health check failed",
+    }
 
 
 @pytest.mark.parametrize(

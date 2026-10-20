@@ -23,6 +23,8 @@ a la clave privada configurada en el backend Quarkus. La API verifica JWT RS256,
 emisor `workshop-auth-backend`, audiencia `workshop-api` y expiracion. No hay
 fallback al formato de token legado; sin clave configurada, las rutas protegidas
 responden HTTP 503.
+Los fallos de `GET /api/backend-health` conservan HTTP 200 y usan un mensaje
+genérico en `body`, sin exponer detalles de excepciones remotas.
 
 Swagger: `http://localhost:8000/docs`
 
