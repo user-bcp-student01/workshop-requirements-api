@@ -1,58 +1,222 @@
-import base64
 import time
 from pathlib import Path
 
+import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+import pytest
 
 from app.main import create_app
 
 
-def token(username: str = "student", role: str = "STUDENT") -> str:
-    raw = f"{username}|{role}|{int(time.time()) + 3600}|WORKSHOP_SECRET_2026"
-    return base64.b64encode(raw.encode()).decode()
+@pytest.fixture
+def keypair(tmp_path: Path) -> tuple[object, Path]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_key_path = tmp_path / "auth-public.pem"
+    public_key_path.write_bytes(
+        private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    return private_key, public_key_path
 
 
-def headers(username: str = "student", role: str = "STUDENT") -> dict[str, str]:
-    return {"Authorization": f"Bearer {token(username, role)}"}
+@pytest.fixture
+def test_app(tmp_path: Path, keypair: tuple[object, Path]):
+    _, public_key_path = keypair
+    return create_app(
+        str(tmp_path / "workshop.db"),
+        str(tmp_path / "uploads"),
+        token_public_key_path=str(public_key_path),
+    )
 
 
-def test_lists_seeded_tasks(tmp_path: Path) -> None:
-    app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
-    with TestClient(app) as client:
-        response = client.get("/api/tasks", headers=headers())
+def claims(**overrides: object) -> dict[str, object]:
+    issued_at = int(time.time())
+    result: dict[str, object] = {
+        "sub": "student",
+        "role": "STUDENT",
+        "iss": "workshop-auth-backend",
+        "aud": "workshop-api",
+        "iat": issued_at,
+        "exp": issued_at + 3600,
+    }
+    result.update(overrides)
+    return result
+
+
+def token(private_key: object, **overrides: object) -> str:
+    return jwt.encode(claims(**overrides), private_key, algorithm="RS256")
+
+
+def headers(private_key: object, username: str = "student", role: str = "STUDENT") -> dict[str, str]:
+    return {"Authorization": f"Bearer {token(private_key, sub=username, role=role)}"}
+
+
+def test_accepts_auth_backend_jwt(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers=headers(private_key))
+
+    assert response.status_code == 200
+    assert all(task["owner"] == "student" for task in response.json())
+
+
+def test_lists_seeded_tasks(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers=headers(private_key))
     assert response.status_code == 200
     assert len(response.json()) == 2
 
 
-def test_creates_task_and_summary(tmp_path: Path) -> None:
-    app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
-    with TestClient(app) as client:
+def test_creates_task_and_summary(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
         created = client.post(
             "/api/tasks",
-            headers=headers(),
+            headers=headers(private_key),
             json={"title": "Add tests", "description": "Improve coverage", "status": "TODO", "priority": "HIGH"},
         )
-        summary = client.get("/api/summary", headers=headers())
+        summary = client.get("/api/summary", headers=headers(private_key))
     assert created.status_code == 201
     assert created.json()["owner"] == "student"
     assert summary.json()["total"] == 3
 
 
-def test_uploads_requirement(tmp_path: Path) -> None:
-    upload_dir = tmp_path / "uploads"
-    app = create_app(str(tmp_path / "workshop.db"), str(upload_dir))
-    with TestClient(app) as client:
+def test_task_queries_treat_quoted_owner_as_literal(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        tasks = client.get("/api/tasks", headers=headers(private_key), params={"owner": "student's team"})
+        summary = client.get("/api/summary", headers=headers(private_key), params={"owner": "student's team"})
+
+    assert tasks.status_code == 200
+    assert tasks.json() == []
+    assert summary.status_code == 200
+    assert summary.json() == {
+        "owner": "student's team",
+        "total": 0,
+        "byStatus": {},
+        "highPriorityOpen": 0,
+    }
+
+
+def test_task_creation_preserves_quoted_text(test_app, keypair: tuple[object, Path]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        response = client.post(
+            "/api/tasks",
+            headers=headers(private_key),
+            json={"title": "Owner's task", "description": "Needs user's review"},
+        )
+
+    assert response.status_code == 201
+    assert response.json()["title"] == "Owner's task"
+    assert response.json()["description"] == "Needs user's review"
+
+
+def test_uploads_requirement(test_app, keypair: tuple[object, Path], tmp_path: Path) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
         response = client.post(
             "/api/requirements",
-            headers=headers(),
+            headers=headers(private_key),
             files={"file": ("requirements.txt", b"Login must be accessible", "text/plain")},
         )
     assert response.status_code == 201
-    assert (upload_dir / "requirements.txt").exists()
+    assert (tmp_path / "uploads" / "requirements.txt").exists()
 
 
-def test_rejects_invalid_token(tmp_path: Path) -> None:
+def test_backend_health_does_not_expose_exception(test_app, keypair: tuple[object, Path], monkeypatch) -> None:
+    private_key, _ = keypair
+
+    def fail_request(*args, **kwargs) -> None:
+        raise RuntimeError("sensitive downstream details")
+
+    monkeypatch.setattr("app.main.urllib3.PoolManager.request", fail_request)
+    with TestClient(test_app) as client:
+        response = client.get("/api/backend-health", headers=headers(private_key))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "requestedBy": "student",
+        "status": 0,
+        "body": "Backend health check failed",
+    }
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"iss": "untrusted-issuer"},
+        {"aud": "other-api"},
+        {"exp": int(time.time()) - 1},
+        {"sub": ""},
+        {"role": ""},
+    ],
+)
+def test_rejects_invalid_claims(test_app, keypair: tuple[object, Path], overrides: dict[str, object]) -> None:
+    private_key, _ = keypair
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers={"Authorization": f"Bearer {token(private_key, **overrides)}"})
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid token"}
+
+
+@pytest.mark.parametrize("missing_claim", ["exp", "iat", "sub", "role"])
+def test_rejects_missing_required_claims(test_app, keypair: tuple[object, Path], missing_claim: str) -> None:
+    private_key, _ = keypair
+    token_claims = claims()
+    del token_claims[missing_claim]
+    signed_token = jwt.encode(token_claims, private_key, algorithm="RS256")
+
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers={"Authorization": f"Bearer {signed_token}"})
+    assert response.status_code == 401
+
+
+def test_rejects_wrong_signature(test_app) -> None:
+    wrong_private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers={"Authorization": f"Bearer {token(wrong_private_key)}"})
+    assert response.status_code == 401
+
+
+def test_rejects_unsupported_algorithm(test_app, keypair: tuple[object, Path]) -> None:
+    payload = claims()
+    unsigned = jwt.encode(payload, "not-an-rsa-key", algorithm="HS256")
+    with TestClient(test_app) as client:
+        response = client.get("/api/tasks", headers={"Authorization": f"Bearer {unsigned}"})
+    assert response.status_code == 401
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "request_kwargs"),
+    [
+        ("get", "/api/tasks", {}),
+        ("post", "/api/tasks", {"json": {"title": "Test"}}),
+        ("get", "/api/summary", {}),
+        ("post", "/api/requirements", {"files": {"file": ("requirements.txt", b"test", "text/plain")}}),
+        ("get", "/api/backend-health", {}),
+    ],
+)
+def test_protected_routes_reject_invalid_tokens(test_app, method: str, path: str, request_kwargs: dict[str, object]) -> None:
+    with TestClient(test_app) as client:
+        response = getattr(client, method)(
+            path,
+            headers={"Authorization": "Bearer malformed"},
+            **request_kwargs,
+        )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid token"}
+
+
+def test_fails_closed_when_public_key_is_not_configured(tmp_path: Path) -> None:
     app = create_app(str(tmp_path / "workshop.db"), str(tmp_path / "uploads"))
     with TestClient(app) as client:
-        response = client.get("/api/tasks", headers={"Authorization": "Bearer invalid"})
-    assert response.status_code == 401
+        response = client.get("/api/tasks", headers={"Authorization": "Bearer any-token"})
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Token validation is not configured"}

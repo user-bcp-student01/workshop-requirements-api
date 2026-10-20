@@ -3,3 +3,4 @@ uvicorn[standard]==0.48.0
 pydantic==2.13.4
 urllib3==2.5.0
 python-multipart==0.0.21
+PyJWT[crypto]==2.15.1
